@@ -30,7 +30,13 @@ export function createWorkers(deps: Deps, sep: SepContext = createSepContext(dep
   /* ---------------- on-ramps ---------------- */
 
   async function settleOnrampsOnce(): Promise<number> {
-    const rows = db.prepare("SELECT * FROM onramps WHERE status = 'pending' ORDER BY created_at ASC LIMIT 20").all() as unknown as OnrampRow[];
+    // Fresh (unflagged) deposits first, then least-recently-tried. Rows stuck in awaiting_trust or
+    // treasury_low stay pending forever; ordering by created_at let them monopolize the window and
+    // starve settleable deposits (head-of-line blocking). Bump updated_at on every touch (below) so
+    // stuck rows rotate to the back and never block a settleable deposit.
+    const rows = db
+      .prepare("SELECT * FROM onramps WHERE status = 'pending' ORDER BY (pending_reason IS NULL) DESC, updated_at ASC LIMIT 25")
+      .all() as unknown as OnrampRow[];
     if (!rows.length) return 0;
     let treasury: bigint;
     try {
@@ -43,8 +49,9 @@ export function createWorkers(deps: Deps, sep: SepContext = createSepContext(dep
     for (const row of rows) {
       const stroops = parseUsdc(row.amount_usdc);
       if (stroops > treasury) {
+        const firstTime = row.pending_reason !== 'treasury_low';
         db.prepare("UPDATE onramps SET pending_reason = 'treasury_low', updated_at = ? WHERE id = ?").run(nowIso(), row.id);
-        log.warn(`onramp ${row.id} waiting: treasury has ${fmtUsdc(treasury)} USDC, needs ${row.amount_usdc}`);
+        if (firstTime) log.warn(`onramp ${row.id} waiting: treasury has ${fmtUsdc(treasury)} USDC, needs ${row.amount_usdc}`);
         continue;
       }
       try {
@@ -56,11 +63,11 @@ export function createWorkers(deps: Deps, sep: SepContext = createSepContext(dep
         });
         if (res.settlement === 'awaiting_trust') {
           // Wallet did not opt into claimable balances and has no trustline yet. Hold (no funds move,
-          // no attempt spent); a later tick pays directly once the trustline appears.
-          if (row.pending_reason !== 'awaiting_trust') {
-            db.prepare("UPDATE onramps SET pending_reason = 'awaiting_trust', updated_at = ? WHERE id = ?").run(nowIso(), row.id);
-            log.info(`onramp ${row.id} awaiting a USDC trustline on ${row.destination_address}`);
-          }
+          // no attempt spent); a later tick pays directly once the trustline appears. Always bump
+          // updated_at so this row rotates to the back and does not starve settleable deposits.
+          const firstTime = row.pending_reason !== 'awaiting_trust';
+          db.prepare("UPDATE onramps SET pending_reason = 'awaiting_trust', updated_at = ? WHERE id = ?").run(nowIso(), row.id);
+          if (firstTime) log.info(`onramp ${row.id} awaiting a USDC trustline on ${row.destination_address}`);
           continue;
         }
         treasury -= stroops;
